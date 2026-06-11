@@ -1,13 +1,16 @@
 """
-YouTube Channel Finder — applicazione web Flask basata su yt-dlp.
+YouTube Channel Finder — applicazione web Flask basata sulla YouTube Data API v3.
 
 Permette di cercare canali YouTube a partire da una keyword, filtrando per
 finestra temporale, views minime, durata dei video e numero massimo di iscritti
 del canale (utile per scovare canali piccoli/emergenti).
 
-Per ogni canale trovato mostra: nome, link, data del primo video, video piu'
-visto con relative views e una stima sullo stato di monetizzazione (basata sulle
-soglie YouTube Partner Program: 1000 iscritti + 4000 ore di watch time annuo).
+Flusso dati:
+  1. Search API   -> trova i video per keyword (filtri data + durata).
+  2. Videos API   -> views, durata reale, titolo di ogni video.
+  3. Channels API -> iscritti reali e data di creazione del canale.
+  4. Outlier score = views del video top / iscritti del canale.
+  5. (best-effort) scraping di socialblade.com per la crescita a 30 giorni.
 
 Avvio:
     python interface.py
@@ -15,17 +18,14 @@ Poi apri http://127.0.0.1:5000 nel browser.
 """
 
 import datetime as _dt
+import json
+import os
+import re
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import requests
 from flask import Flask, render_template_string, request
-
-try:
-    from yt_dlp import YoutubeDL
-except ImportError as exc:  # pragma: no cover
-    raise SystemExit(
-        "yt-dlp non e' installato. Esegui:  pip install yt-dlp"
-    ) from exc
 
 app = Flask(__name__)
 
@@ -33,14 +33,26 @@ app = Flask(__name__)
 # Configurazione / costanti
 # ---------------------------------------------------------------------------
 
+# API key: preferibilmente da variabile d'ambiente YOUTUBE_API_KEY.
+# NOTA DI SICUREZZA: evita di lasciare la chiave hardcoded in produzione e
+# restringila (per referer/API) dalla Google Cloud Console.
+API_KEY = os.environ.get("YOUTUBE_API_KEY") or "AIzaSyBievBwnEXPM0ApRWUX-eWTt8FYhHNZGwQ"
+API_BASE = "https://www.googleapis.com/youtube/v3"
+
 # Soglie YouTube Partner Program per la monetizzazione.
 MONETIZATION_MIN_SUBS = 1000
 MONETIZATION_MIN_WATCH_HOURS = 4000
 
-# Quanti risultati di ricerca esaminare al massimo (piu' alto = piu' lento).
-SEARCH_POOL = 60
+# Quanti risultati di ricerca esaminare (la Search API ne restituisce max 50 per pagina).
+SEARCH_MAX_RESULTS = 50
 
-# Durate (in secondi) per i filtri.
+# User-Agent "browser-like" per lo scraping best-effort di SocialBlade.
+SCRAPE_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+)
+
+# Durate (in secondi) per i filtri lato applicazione.
 DURATION_FILTERS = {
     "all": (None, None),
     "short": (None, 60),          # Shorts: < 60s
@@ -48,42 +60,25 @@ DURATION_FILTERS = {
     "long": (8 * 60, None),       # > 8 minuti
 }
 
+# Mappatura del filtro durata al parametro videoDuration della Search API.
+# L'API conosce solo short(<4min)/medium(4-20min)/long(>20min): usiamola solo
+# dove restringe correttamente, poi filtriamo con precisione lato client.
+SEARCH_DURATION_PARAM = {
+    "all": "any",
+    "short": "short",   # <4min copre i nostri <60s, poi rifiniamo
+    "medium": "any",    # 1-8min sta a cavallo: meglio "any" + filtro client
+    "long": "any",      # i nostri >8min includono 8-20min: "long" API li perderebbe
+}
+
 # Finestre temporali disponibili (in mesi).
 TIME_WINDOWS = {"3": 3, "6": 6, "12": 12}
 
-# --- Autenticazione cookie (per superare "Sign in to confirm you're not a bot") ---
-#
-# YouTube blocca yt-dlp se non riceve i cookie di una sessione reale. Due modi:
-#
-#  A) File cookies.txt (CONSIGLIATO su Windows): esporta i cookie con un'estensione
-#     del browser (es. "Get cookies.txt LOCALLY") e salva il file accanto a questo
-#     script. Funziona anche con il browser aperto.
-#  B) Estrazione diretta dal browser: richiede che il browser sia COMPLETAMENTE
-#     chiuso, altrimenti il database dei cookie e' bloccato (yt-dlp issue #7271).
-#
-# Il file cookies.txt, se presente, ha la precedenza sul browser.
-import os as _os
-
-COOKIES_FILE = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "cookies.txt")
-
-# Browser da cui estrarre i cookie se cookies.txt non esiste. None per disabilitare.
-# Valori validi: "brave", "chrome", "edge", "firefox", "chromium", "opera", ...
-COOKIES_BROWSER = "brave"
-
-
-def _base_ydl_opts() -> dict:
-    """Opzioni comuni a tutte le istanze YoutubeDL (inclusa l'autenticazione cookie)."""
-    opts = {"quiet": True, "no_warnings": True, "skip_download": True}
-    if _os.path.exists(COOKIES_FILE):
-        opts["cookiefile"] = COOKIES_FILE
-    elif COOKIES_BROWSER:
-        # yt-dlp si aspetta una tupla: (nome_browser, profilo, keyring, container).
-        opts["cookiesfrombrowser"] = (COOKIES_BROWSER, None, None, None)
-    return opts
+# Regex per la durata ISO 8601 (es. PT1H2M3S) restituita dalla Videos API.
+_ISO_DUR_RE = re.compile(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$")
 
 
 # ---------------------------------------------------------------------------
-# Logica di ricerca
+# Helper generici
 # ---------------------------------------------------------------------------
 
 def _months_ago(months: int) -> _dt.date:
@@ -91,21 +86,31 @@ def _months_ago(months: int) -> _dt.date:
     return _dt.date.today() - _dt.timedelta(days=months * 30)
 
 
-def _parse_upload_date(raw) -> _dt.date | None:
-    """Converte una data yt-dlp (YYYYMMDD o timestamp) in date."""
-    if raw is None:
+def _parse_rfc3339_date(raw) -> _dt.date | None:
+    """Converte una data RFC3339 (es. 2025-12-05T00:00:00Z) in date."""
+    if not raw:
         return None
     try:
-        return _dt.datetime.strptime(str(raw), "%Y%m%d").date()
+        return _dt.datetime.fromisoformat(str(raw).replace("Z", "+00:00")).date()
     except (ValueError, TypeError):
         return None
+
+
+def _parse_iso_duration(raw) -> int | None:
+    """Converte una durata ISO 8601 (PT#H#M#S) in secondi."""
+    if not raw:
+        return None
+    m = _ISO_DUR_RE.fullmatch(str(raw))
+    if not m:
+        return None
+    h, mi, se = (int(x) if x else 0 for x in m.groups())
+    return h * 3600 + mi * 60 + se
 
 
 def _duration_ok(duration, filter_key: str) -> bool:
     """Verifica se la durata (secondi) rientra nel filtro selezionato."""
     lo, hi = DURATION_FILTERS.get(filter_key, (None, None))
     if duration is None:
-        # Senza informazioni sulla durata accettiamo solo il filtro "all".
         return filter_key == "all"
     if lo is not None and duration < lo:
         return False
@@ -114,42 +119,194 @@ def _duration_ok(duration, filter_key: str) -> bool:
     return True
 
 
-def _search_videos(keyword: str, pool: int) -> list[dict]:
-    """Esegue una ricerca YouTube e ritorna i metadati 'flat' dei video."""
-    opts = _base_ydl_opts()
-    opts["extract_flat"] = True
-    query = f"ytsearch{pool}:{keyword}"
-    print(f"[DEBUG] _search_videos: PRIMA della chiamata yt-dlp, query={query!r}")
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(query, download=False)
-    entries = [e for e in (info or {}).get("entries", []) if e]
-    print(f"[DEBUG] _search_videos: DOPO la chiamata yt-dlp, {len(entries)} video grezzi")
-    if entries:
-        print(f"[DEBUG] _search_videos: primo entry id={entries[0].get('id')!r} "
-              f"chiavi={list(entries[0].keys())}")
-    return entries
+# ---------------------------------------------------------------------------
+# Chiamate alla YouTube Data API v3
+# ---------------------------------------------------------------------------
+
+def _api_get(endpoint: str, params: dict) -> dict:
+    """Esegue una GET sull'API YouTube e ritorna il JSON, alzando errori parlanti."""
+    params = {**params, "key": API_KEY}
+    resp = requests.get(f"{API_BASE}/{endpoint}", params=params, timeout=20)
+    if resp.status_code != 200:
+        try:
+            msg = resp.json()["error"]["message"]
+        except Exception:  # noqa: BLE001
+            msg = resp.text[:200]
+        raise RuntimeError(f"YouTube API '{endpoint}' HTTP {resp.status_code}: {msg}")
+    return resp.json()
 
 
-def _fetch_video_details(video_id: str) -> dict | None:
-    """Recupera i dettagli completi di un singolo video."""
-    opts = _base_ydl_opts()
-    url = f"https://www.youtube.com/watch?v={video_id}"
+def _search_video_ids(keyword: str, cutoff: _dt.date, duration_key: str) -> list[str]:
+    """1) Search API: trova gli ID dei video per keyword, data e durata."""
+    published_after = _dt.datetime.combine(cutoff, _dt.time.min).isoformat() + "Z"
+    params = {
+        "part": "snippet",
+        "q": keyword,
+        "type": "video",
+        "order": "viewCount",          # i piu' visti emergono prima (utile per outlier)
+        "publishedAfter": published_after,
+        "videoDuration": SEARCH_DURATION_PARAM.get(duration_key, "any"),
+        "maxResults": min(SEARCH_MAX_RESULTS, 50),
+    }
+    print(f"[DEBUG] search: q={keyword!r} publishedAfter={published_after} "
+          f"videoDuration={params['videoDuration']}")
+    data = _api_get("search", params)
+    ids = [
+        it["id"]["videoId"]
+        for it in data.get("items", [])
+        if it.get("id", {}).get("videoId")
+    ]
+    print(f"[DEBUG] search: {len(ids)} video ID trovati")
+    return ids
+
+
+def _fetch_videos(video_ids: list[str]) -> list[dict]:
+    """2) Videos API: dettagli (views, durata, titolo) a batch da 50."""
+    items: list[dict] = []
+    for i in range(0, len(video_ids), 50):
+        batch = video_ids[i:i + 50]
+        data = _api_get(
+            "videos",
+            {"part": "snippet,contentDetails,statistics", "id": ",".join(batch)},
+        )
+        items.extend(data.get("items", []))
+    print(f"[DEBUG] videos: dettagli recuperati per {len(items)} video")
+    return items
+
+
+def _fetch_channels(channel_ids: list[str]) -> dict[str, dict]:
+    """3) Channels API: iscritti reali e data creazione, a batch da 50."""
+    result: dict[str, dict] = {}
+    ids = list(channel_ids)
+    for i in range(0, len(ids), 50):
+        batch = ids[i:i + 50]
+        data = _api_get(
+            "channels",
+            {"part": "snippet,statistics", "id": ",".join(batch)},
+        )
+        for it in data.get("items", []):
+            result[it["id"]] = it
+    print(f"[DEBUG] channels: metadati recuperati per {len(result)} canali")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Scraping best-effort di SocialBlade (crescita ultimi 30 giorni)
+# ---------------------------------------------------------------------------
+
+def _scrape_socialblade(channel_id: str) -> dict | None:
+    """
+    Recupera la crescita recente dalla pagina pubblica di SocialBlade.
+
+    BEST-EFFORT: SocialBlade e' dietro Cloudflare e il suo ToS vieta lo scraping.
+    I numeri sono renderizzati via React e incapsulati nel blob JSON __NEXT_DATA__:
+    ne estraiamo la serie temporale giornaliera (date/subscribers/views) e calcoliamo
+    la crescita come differenza tra l'ultimo e il primo punto disponibile.
+    Se la pagina e' protetta o cambia struttura, ritorniamo None senza bloccare la
+    ricerca. Per dati affidabili/completi usare l'API ufficiale (a pagamento).
+    """
+    url = f"https://socialblade.com/youtube/channel/{channel_id}/monthly"
     try:
-        with YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=False)
-    except Exception as exc:  # noqa: BLE001 — un video puo' fallire senza bloccare tutto
-        # Prima questo errore veniva ingoiato silenziosamente: ora lo stampiamo.
-        print(f"[DEBUG] _fetch_video_details: FALLITO video {video_id!r}: "
-              f"{type(exc).__name__}: {exc}")
+        resp = requests.get(url, headers={"User-Agent": SCRAPE_UA}, timeout=12)
+    except requests.RequestException as exc:
+        print(f"[DEBUG] socialblade: rete KO per {channel_id}: {exc}")
         return None
 
+    if resp.status_code != 200:
+        print(f"[DEBUG] socialblade: HTTP {resp.status_code} per {channel_id}")
+        return None
+
+    html = resp.text
+    # Rileva la challenge di Cloudflare / pagina che richiede JavaScript.
+    if "Just a moment" in html or "cf-browser-verification" in html:
+        print(f"[DEBUG] socialblade: bloccato da Cloudflare per {channel_id}")
+        return {"blocked": True, "subs_30d": None, "views_30d": None, "days": None}
+
+    series = _extract_socialblade_series(html)
+    if not series or len(series) < 2:
+        print(f"[DEBUG] socialblade: serie temporale non trovata per {channel_id}")
+        return None
+
+    first, last = series[0], series[-1]
+    subs_delta = _safe_int(last.get("subscribers")) - _safe_int(first.get("subscribers"))
+    views_delta = _safe_int(last.get("views")) - _safe_int(first.get("views"))
+    days = _series_days(first.get("date"), last.get("date"))
+    print(f"[DEBUG] socialblade: {channel_id} +{subs_delta} iscr / +{views_delta} "
+          f"views su ~{days} gg")
+    return {
+        "blocked": False,
+        "subs_30d": _fmt_delta(subs_delta),
+        "views_30d": _fmt_delta(views_delta),
+        "days": days,
+    }
+
+
+def _extract_socialblade_series(html: str) -> list[dict] | None:
+    """Estrae dal blob __NEXT_DATA__ la serie giornaliera con date/subscribers/views."""
+    m = re.search(
+        r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+        html, re.S,
+    )
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+
+    # La serie e' una delle 'queries' tRPC: cerchiamo la lista di dict che contiene
+    # contemporaneamente 'date', 'subscribers' e 'views'.
+    best: list[dict] | None = None
+    stack = [data]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            if (
+                node
+                and isinstance(node[0], dict)
+                and {"date", "subscribers", "views"} <= set(node[0].keys())
+            ):
+                if best is None or len(node) > len(best):
+                    best = node
+            else:
+                stack.extend(node)
+    if not best:
+        return None
+    # Ordina cronologicamente per sicurezza.
+    return sorted(best, key=lambda p: str(p.get("date")))
+
+
+def _safe_int(v) -> int:
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _series_days(first_date, last_date) -> int | None:
+    d0 = _parse_rfc3339_date(first_date)
+    d1 = _parse_rfc3339_date(last_date)
+    return (d1 - d0).days if d0 and d1 else None
+
+
+def _fmt_delta(n: int) -> str:
+    """Formatta un delta con segno e separatore di migliaia (stile italiano)."""
+    sign = "+" if n >= 0 else "-"
+    return f"{sign}{'{:,}'.format(abs(n)).replace(',', '.')}"
+
+
+# ---------------------------------------------------------------------------
+# Monetizzazione (stima)
+# ---------------------------------------------------------------------------
 
 def _estimate_monetization(subs, total_views: int) -> dict:
     """
     Stima lo stato di monetizzazione di un canale.
 
-    Le ore di watch time non sono esposte da yt-dlp, quindi le stimiamo dalle
-    views aggregate ipotizzando una durata media di visione di ~3 minuti.
+    Le ore di watch time non sono esposte dall'API pubblica, quindi le stimiamo
+    dalle views aggregate ipotizzando ~3 minuti di visione media per view.
     """
     est_watch_hours = round((total_views * 3) / 60) if total_views else 0
     subs_ok = subs is not None and subs >= MONETIZATION_MIN_SUBS
@@ -171,83 +328,63 @@ def _estimate_monetization(subs, total_views: int) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Pipeline di ricerca
+# ---------------------------------------------------------------------------
+
 def search_channels(
     keyword: str,
     months: int,
     min_views: int,
     duration_key: str,
     max_subs: int | None,
+    enable_socialblade: bool = True,
 ) -> list[dict]:
-    """
-    Cerca canali YouTube secondo i criteri indicati.
-
-    Ritorna una lista di dizionari, uno per canale, gia' pronti per il template.
-    """
+    """Cerca canali YouTube secondo i criteri indicati e ritorna i dati pronti."""
     print("\n" + "=" * 70)
-    print(f"[DEBUG] search_channels: AVVIO ricerca")
-    print(f"[DEBUG]   keyword={keyword!r} months={months} min_views={min_views} "
-          f"duration_key={duration_key!r} max_subs={max_subs}")
+    print(f"[DEBUG] search_channels: keyword={keyword!r} months={months} "
+          f"min_views={min_views} duration={duration_key!r} max_subs={max_subs}")
     cutoff = _months_ago(months)
-    print(f"[DEBUG]   cutoff (data minima primo video) = {cutoff}")
+    print(f"[DEBUG]   cutoff = {cutoff}")
 
-    raw_videos = _search_videos(keyword, SEARCH_POOL)
-    if not raw_videos:
-        print("[DEBUG] search_channels: yt-dlp non ha restituito NESSUN video. "
-              "Possibile blocco di rete, captcha o keyword senza risultati.")
+    # 1) Search API -> ID video.
+    video_ids = _search_video_ids(keyword, cutoff, duration_key)
+    if not video_ids:
+        print("[DEBUG] search_channels: nessun video dalla Search API")
+        return []
 
-    # Raccogliamo i dettagli dei video in parallelo (rete-bound).
-    print(f"[DEBUG] search_channels: recupero dettagli di {len(raw_videos)} video...")
-    detailed: list[dict] = []
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {
-            pool.submit(_fetch_video_details, v.get("id")): v
-            for v in raw_videos
-            if v.get("id")
-        }
-        for fut in as_completed(futures):
-            info = fut.result()
-            if info:
-                detailed.append(info)
-    print(f"[DEBUG] search_channels: dettagli recuperati con successo: "
-          f"{len(detailed)}/{len(raw_videos)}")
+    # 2) Videos API -> dettagli.
+    videos = _fetch_videos(video_ids)
 
-    # Contatori per capire dove vengono scartati i video.
-    skip_no_chid = skip_views = skip_duration = skip_date = kept = 0
-
-    # Aggrega per canale.
+    # Filtri a livello di video + aggregazione per canale.
+    skip_views = skip_duration = kept = 0
     channels: dict[str, dict] = {}
-    for v in detailed:
-        ch_id = v.get("channel_id") or v.get("uploader_id")
-        if not ch_id:
-            skip_no_chid += 1
-            continue
+    for v in videos:
+        stats = v.get("statistics", {})
+        snippet = v.get("snippet", {})
+        content = v.get("contentDetails", {})
 
-        views = v.get("view_count") or 0
-        duration = v.get("duration")
-        upload_date = _parse_upload_date(v.get("upload_date"))
+        views = int(stats.get("viewCount", 0) or 0)
+        duration = _parse_iso_duration(content.get("duration"))
 
-        # Filtri a livello di video.
         if views < min_views:
             skip_views += 1
             continue
         if not _duration_ok(duration, duration_key):
             skip_duration += 1
             continue
-        if upload_date is not None and upload_date < cutoff:
-            skip_date += 1
-            continue
         kept += 1
+
+        ch_id = snippet.get("channelId")
+        if not ch_id:
+            continue
 
         ch = channels.setdefault(
             ch_id,
             {
                 "channel_id": ch_id,
-                "name": v.get("channel") or v.get("uploader") or "(sconosciuto)",
-                "url": v.get("channel_url")
-                or v.get("uploader_url")
-                or f"https://www.youtube.com/channel/{ch_id}",
-                "subs": v.get("channel_follower_count"),
-                "first_video_date": upload_date,
+                "name": snippet.get("channelTitle") or "(sconosciuto)",
+                "url": f"https://www.youtube.com/channel/{ch_id}",
                 "top_video": None,
                 "top_views": -1,
                 "total_views": 0,
@@ -255,34 +392,40 @@ def search_channels(
             },
         )
 
-        # Aggiorna iscritti se non ancora noti.
-        if ch["subs"] is None and v.get("channel_follower_count") is not None:
-            ch["subs"] = v.get("channel_follower_count")
-
-        # Primo video (data piu' antica vista).
-        if upload_date is not None:
-            if ch["first_video_date"] is None or upload_date < ch["first_video_date"]:
-                ch["first_video_date"] = upload_date
-
-        # Video piu' visto.
         if views > ch["top_views"]:
             ch["top_views"] = views
             ch["top_video"] = {
-                "title": v.get("title") or "(senza titolo)",
-                "url": v.get("webpage_url")
-                or f"https://www.youtube.com/watch?v={v.get('id')}",
+                "title": snippet.get("title") or "(senza titolo)",
+                "url": f"https://www.youtube.com/watch?v={v.get('id')}",
                 "views": views,
             }
-
         ch["total_views"] += views
         ch["match_count"] += 1
 
-    print(f"[DEBUG] search_channels: filtri video -> tenuti={kept} "
-          f"scartati[no_channel_id={skip_no_chid}, views<{min_views}={skip_views}, "
-          f"durata={skip_duration}, troppo_vecchi={skip_date}]")
-    print(f"[DEBUG] search_channels: canali unici aggregati = {len(channels)}")
+    print(f"[DEBUG] filtri video -> tenuti={kept} "
+          f"scartati[views<{min_views}={skip_views}, durata={skip_duration}]")
+    print(f"[DEBUG] canali unici aggregati = {len(channels)}")
+    if not channels:
+        return []
 
-    # Filtro sul numero massimo di iscritti + calcolo monetizzazione.
+    # 3) Channels API -> iscritti reali + data creazione.
+    ch_meta = _fetch_channels(list(channels.keys()))
+    for ch_id, ch in channels.items():
+        meta = ch_meta.get(ch_id, {})
+        c_stats = meta.get("statistics", {})
+        c_snip = meta.get("snippet", {})
+        subs = c_stats.get("subscriberCount")
+        ch["subs"] = int(subs) if subs is not None else None
+        ch["subs_hidden"] = c_stats.get("hiddenSubscriberCount", False)
+        ch["created_date"] = _parse_rfc3339_date(c_snip.get("publishedAt"))
+
+        # 4) Outlier score = views top / iscritti.
+        if ch["subs"] and ch["subs"] > 0:
+            ch["outlier_score"] = round(ch["top_views"] / ch["subs"], 1)
+        else:
+            ch["outlier_score"] = None
+
+    # Filtro sul numero massimo di iscritti + monetizzazione.
     skip_subs = 0
     results: list[dict] = []
     for ch in channels.values():
@@ -291,13 +434,30 @@ def search_channels(
             continue
         ch["monetization"] = _estimate_monetization(ch["subs"], ch["total_views"])
         results.append(ch)
+    print(f"[DEBUG] scartati per iscritti>{max_subs}: {skip_subs} | "
+          f"canali finali = {len(results)}")
 
-    print(f"[DEBUG] search_channels: scartati per iscritti>{max_subs}: {skip_subs}")
-    print(f"[DEBUG] search_channels: RISULTATI FINALI = {len(results)}")
+    # 5) SocialBlade (best-effort, in parallelo).
+    if enable_socialblade and results:
+        print(f"[DEBUG] socialblade: scraping per {len(results)} canali...")
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = {
+                pool.submit(_scrape_socialblade, ch["channel_id"]): ch
+                for ch in results
+            }
+            for fut in as_completed(futures):
+                futures[fut]["socialblade"] = fut.result()
+    else:
+        for ch in results:
+            ch["socialblade"] = None
+
+    # Ordina per outlier score (poi per views top come tie-break).
+    results.sort(
+        key=lambda c: (c["outlier_score"] or 0, c["top_views"]),
+        reverse=True,
+    )
+    print("[DEBUG] search_channels: FATTO")
     print("=" * 70 + "\n")
-
-    # Ordina per views del video piu' visto (decrescente).
-    results.sort(key=lambda c: c["top_views"], reverse=True)
     return results
 
 
@@ -316,7 +476,7 @@ PAGE = """
     :root {
       --bg: #0f0f0f; --card: #1c1c1c; --line: #303030;
       --text: #f1f1f1; --muted: #aaaaaa; --accent: #ff0033;
-      --green: #2ecc71; --orange: #f39c12; --red: #e74c3c;
+      --green: #2ecc71; --orange: #f39c12; --red: #e74c3c; --blue: #4ea1ff;
     }
     * { box-sizing: border-box; }
     body {
@@ -327,7 +487,7 @@ PAGE = """
     header h1 { margin: 0; font-size: 1.7rem; }
     header h1 span { color: var(--accent); }
     header p { color: var(--muted); margin: 6px 0 0; font-size: .9rem; }
-    .wrap { max-width: 960px; margin: 0 auto; padding: 16px 20px 60px; }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 16px 20px 60px; }
     form {
       background: var(--card); border: 1px solid var(--line);
       border-radius: 14px; padding: 20px; display: grid;
@@ -352,22 +512,25 @@ PAGE = """
       background: var(--card); border: 1px solid var(--line); border-radius: 14px;
       padding: 18px 20px; margin-bottom: 14px;
     }
-    .card h3 { margin: 0 0 4px; font-size: 1.15rem; }
+    .card h3 { margin: 0 0 4px; font-size: 1.15rem; display: inline-block; }
     .card h3 a { color: var(--text); text-decoration: none; }
     .card h3 a:hover { color: var(--accent); }
     .row { display: flex; flex-wrap: wrap; gap: 18px 28px; margin-top: 10px; }
     .stat { display: flex; flex-direction: column; }
     .stat .k { font-size: .72rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
     .stat .v { font-size: .98rem; }
-    .stat .v a { color: #4ea1ff; text-decoration: none; }
+    .stat .v a { color: var(--blue); text-decoration: none; }
     .stat .v a:hover { text-decoration: underline; }
     .badge {
       display: inline-block; padding: 4px 10px; border-radius: 999px;
-      font-size: .78rem; font-weight: 600;
+      font-size: .78rem; font-weight: 600; margin-left: 8px;
     }
     .badge.yes { background: rgba(46,204,113,.15); color: var(--green); }
     .badge.partial { background: rgba(243,156,18,.15); color: var(--orange); }
     .badge.no { background: rgba(231,76,60,.15); color: var(--red); }
+    .outlier { font-weight: 700; }
+    .outlier.hot { color: var(--green); }
+    .outlier.mid { color: var(--orange); }
     .empty { color: var(--muted); text-align: center; padding: 30px; }
     .error { background: rgba(231,76,60,.1); border: 1px solid var(--red);
              color: #ffb3ab; border-radius: 10px; padding: 14px; }
@@ -377,7 +540,7 @@ PAGE = """
 <body>
   <header>
     <h1><span>▶</span> YouTube Channel Finder</h1>
-    <p>Trova canali piccoli ed emergenti tramite yt-dlp</p>
+    <p>Trova canali piccoli ed emergenti tramite la YouTube Data API v3</p>
   </header>
   <div class="wrap">
     <form method="post">
@@ -426,7 +589,7 @@ PAGE = """
       <div class="error">{{ error }}</div>
     {% elif searched %}
       <div class="meta">{{ results|length }} canale/i trovato/i per
-        “{{ f.keyword }}”.</div>
+        “{{ f.keyword }}”. Ordinati per outlier score (views top / iscritti).</div>
       {% if results %}
         {% for c in results %}
           <div class="card">
@@ -434,12 +597,18 @@ PAGE = """
             <span class="badge {{ c.monetization.status }}">{{ c.monetization.label }}</span>
             <div class="row">
               <div class="stat">
-                <span class="k">Iscritti</span>
-                <span class="v">{{ '{:,}'.format(c.subs).replace(',', '.') if c.subs is not none else 'n/d' }}</span>
+                <span class="k">Outlier score</span>
+                <span class="v outlier {{ 'hot' if c.outlier_score and c.outlier_score >= 10 else ('mid' if c.outlier_score and c.outlier_score >= 3 else '') }}">
+                  {{ ('%.1fx'|format(c.outlier_score)) if c.outlier_score is not none else 'n/d' }}
+                </span>
               </div>
               <div class="stat">
-                <span class="k">Primo video</span>
-                <span class="v">{{ c.first_video_date.strftime('%d/%m/%Y') if c.first_video_date else 'n/d' }}</span>
+                <span class="k">Iscritti</span>
+                <span class="v">{{ '{:,}'.format(c.subs).replace(',', '.') if c.subs is not none else ('nascosti' if c.subs_hidden else 'n/d') }}</span>
+              </div>
+              <div class="stat">
+                <span class="k">Canale creato</span>
+                <span class="v">{{ c.created_date.strftime('%d/%m/%Y') if c.created_date else 'n/d' }}</span>
               </div>
               <div class="stat">
                 <span class="k">Video piu' visto</span>
@@ -454,8 +623,14 @@ PAGE = """
                 <span class="v">{{ '{:,}'.format(c.top_views).replace(',', '.') if c.top_views >= 0 else 'n/d' }}</span>
               </div>
               <div class="stat">
-                <span class="k">Watch time stimato</span>
-                <span class="v">~{{ '{:,}'.format(c.monetization.est_watch_hours).replace(',', '.') }} h</span>
+                <span class="k">SocialBlade (~{{ c.socialblade.days if c.socialblade and c.socialblade.days else 30 }} gg)</span>
+                <span class="v">
+                  {% if c.socialblade and c.socialblade.blocked %}
+                    bloccato (Cloudflare)
+                  {% elif c.socialblade and (c.socialblade.subs_30d or c.socialblade.views_30d) %}
+                    {{ c.socialblade.subs_30d or '?' }} iscr. / {{ c.socialblade.views_30d or '?' }} views
+                  {% else %}n/d{% endif %}
+                </span>
               </div>
             </div>
           </div>
@@ -467,9 +642,9 @@ PAGE = """
     {% endif %}
   </div>
   <footer>
-    Stima monetizzazione basata sulle soglie YouTube Partner Program:
-    {{ min_subs }} iscritti + {{ min_hours }} h di watch time/anno.
-    Le ore sono stimate dalle views (yt-dlp non le espone).
+    Dati da YouTube Data API v3. Outlier score = views del video piu' visto /
+    iscritti del canale. Crescita 30 giorni da socialblade.com (best-effort:
+    puo' essere bloccata da Cloudflare).
   </footer>
 </body>
 </html>
@@ -482,7 +657,6 @@ PAGE = """
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    # Valori di default del form.
     form = {
         "keyword": "",
         "window": "6",
@@ -524,7 +698,6 @@ def index():
             print(f"[DEBUG] index: ValueError: {exc}")
         except Exception as exc:  # noqa: BLE001 — mostriamo l'errore all'utente
             error = f"Errore durante la ricerca: {exc}"
-            # Traceback completo nel terminale per il debug.
             print("[DEBUG] index: ECCEZIONE durante la ricerca:")
             traceback.print_exc()
 
@@ -534,8 +707,6 @@ def index():
         results=results,
         error=error,
         searched=searched,
-        min_subs=MONETIZATION_MIN_SUBS,
-        min_hours=MONETIZATION_MIN_WATCH_HOURS,
     )
 
 
